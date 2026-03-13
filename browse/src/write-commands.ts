@@ -298,7 +298,8 @@ export async function handleWriteCommand(
 
       const pickerUrl = `http://127.0.0.1:${port}/cookie-picker`;
       try {
-        Bun.spawn(['open', pickerUrl], { stdout: 'ignore', stderr: 'ignore' });
+        const { spawn: spawnProc } = await import('child_process');
+        spawnProc('open', [pickerUrl], { stdio: 'ignore', detached: true }).unref();
       } catch {
         // open may fail silently — URL is in the message below
       }

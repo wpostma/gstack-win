@@ -16,6 +16,11 @@ import { handleCookiePickerRoute } from './cookie-picker-routes';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import * as http from 'http';
+import * as net from 'net';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Auth (inline) ─────────────────────────────────────────────
 const AUTH_TOKEN = crypto.randomUUID();
@@ -56,7 +61,8 @@ async function flushBuffers() {
       const lines = entries.map(e =>
         `[${new Date(e.timestamp).toISOString()}] [${e.level}] ${e.text}`
       ).join('\n') + '\n';
-      await Bun.write(CONSOLE_LOG_PATH, (await Bun.file(CONSOLE_LOG_PATH).text().catch(() => '')) + lines);
+      const existing = fs.existsSync(CONSOLE_LOG_PATH) ? fs.readFileSync(CONSOLE_LOG_PATH, 'utf-8') : '';
+      fs.writeFileSync(CONSOLE_LOG_PATH, existing + lines);
       lastConsoleFlushed = consoleBuffer.totalAdded;
     }
 
@@ -67,7 +73,8 @@ async function flushBuffers() {
       const lines = entries.map(e =>
         `[${new Date(e.timestamp).toISOString()}] ${e.method} ${e.url} → ${e.status || 'pending'} (${e.duration || '?'}ms, ${e.size || '?'}B)`
       ).join('\n') + '\n';
-      await Bun.write(NETWORK_LOG_PATH, (await Bun.file(NETWORK_LOG_PATH).text().catch(() => '')) + lines);
+      const existingNet = fs.existsSync(NETWORK_LOG_PATH) ? fs.readFileSync(NETWORK_LOG_PATH, 'utf-8') : '';
+      fs.writeFileSync(NETWORK_LOG_PATH, existingNet + lines);
       lastNetworkFlushed = networkBuffer.totalAdded;
     }
 
@@ -78,7 +85,8 @@ async function flushBuffers() {
       const lines = entries.map(e =>
         `[${new Date(e.timestamp).toISOString()}] [${e.type}] "${e.message}" → ${e.action}${e.response ? ` "${e.response}"` : ''}`
       ).join('\n') + '\n';
-      await Bun.write(DIALOG_LOG_PATH, (await Bun.file(DIALOG_LOG_PATH).text().catch(() => '')) + lines);
+      const existingDlg = fs.existsSync(DIALOG_LOG_PATH) ? fs.readFileSync(DIALOG_LOG_PATH, 'utf-8') : '';
+      fs.writeFileSync(DIALOG_LOG_PATH, existingDlg + lines);
       lastDialogFlushed = dialogBuffer.totalAdded;
     }
   } catch {
@@ -132,29 +140,28 @@ export const META_COMMANDS = new Set([
 const browserManager = new BrowserManager();
 let isShuttingDown = false;
 
+// Check if a port is available
+function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once('error', () => resolve(false));
+    srv.once('listening', () => { srv.close(); resolve(true); });
+    srv.listen(port, '127.0.0.1');
+  });
+}
+
 // Find port: deterministic from CONDUCTOR_PORT, or scan range
 async function findPort(): Promise<number> {
   // Deterministic port from CONDUCTOR_PORT (e.g., 55040 - 45600 = 9440)
   if (BROWSE_PORT) {
-    try {
-      const testServer = Bun.serve({ port: BROWSE_PORT, fetch: () => new Response('ok') });
-      testServer.stop();
-      return BROWSE_PORT;
-    } catch {
-      throw new Error(`[browse] Port ${BROWSE_PORT} (from CONDUCTOR_PORT ${process.env.CONDUCTOR_PORT}) is in use`);
-    }
+    if (await isPortAvailable(BROWSE_PORT)) return BROWSE_PORT;
+    throw new Error(`[browse] Port ${BROWSE_PORT} (from CONDUCTOR_PORT ${process.env.CONDUCTOR_PORT}) is in use`);
   }
 
   // Fallback: scan range
   const start = parseInt(process.env.BROWSE_PORT_START || '9400', 10);
   for (let port = start; port < start + 10; port++) {
-    try {
-      const testServer = Bun.serve({ port, fetch: () => new Response('ok') });
-      testServer.stop();
-      return port;
-    } catch {
-      continue;
-    }
+    if (await isPortAvailable(port)) return port;
   }
   throw new Error(`[browse] No available port in range ${start}-${start + 9}`);
 }
@@ -257,48 +264,90 @@ async function start() {
   await browserManager.launch();
 
   const startTime = Date.now();
-  const server = Bun.serve({
-    port,
-    hostname: '127.0.0.1',
-    fetch: async (req) => {
-      resetIdleTimer();
 
-      const url = new URL(req.url);
+  // Helper: read full request body
+  function readBody(nodeReq: http.IncomingMessage): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      nodeReq.on('data', (chunk: Buffer) => chunks.push(chunk));
+      nodeReq.on('end', () => resolve(Buffer.concat(chunks).toString()));
+      nodeReq.on('error', reject);
+    });
+  }
 
-      // Cookie picker routes — no auth required (localhost-only)
-      if (url.pathname.startsWith('/cookie-picker')) {
-        return handleCookiePickerRoute(url, req, browserManager);
-      }
+  // Helper: convert Node req to Web API Request
+  function toWebRequest(nodeReq: http.IncomingMessage, url: URL, body?: string): Request {
+    const headers = new Headers();
+    for (const [key, value] of Object.entries(nodeReq.headers)) {
+      if (value) headers.set(key, Array.isArray(value) ? value.join(', ') : value);
+    }
+    return new Request(url.toString(), {
+      method: nodeReq.method,
+      headers,
+      body: nodeReq.method === 'POST' ? body : undefined,
+    });
+  }
 
-      // Health check — no auth required (now async)
-      if (url.pathname === '/health') {
-        const healthy = await browserManager.isHealthy();
-        return new Response(JSON.stringify({
-          status: healthy ? 'healthy' : 'unhealthy',
-          uptime: Math.floor((Date.now() - startTime) / 1000),
-          tabs: browserManager.getTabCount(),
-          currentUrl: browserManager.getCurrentUrl(),
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
+  // Helper: send Web API Response to Node res
+  async function sendResponse(nodeRes: http.ServerResponse, response: Response) {
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => { headers[key] = value; });
+    nodeRes.writeHead(response.status, headers);
+    nodeRes.end(await response.text());
+  }
 
-      // All other endpoints require auth
-      if (!validateAuth(req)) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
+  const server = http.createServer(async (nodeReq, nodeRes) => {
+    resetIdleTimer();
 
-      if (url.pathname === '/command' && req.method === 'POST') {
-        const body = await req.json();
-        return handleCommand(body);
-      }
+    const url = new URL(nodeReq.url!, `http://127.0.0.1:${port}`);
 
-      return new Response('Not found', { status: 404 });
-    },
+    // Read body for POST
+    const body = nodeReq.method === 'POST' ? await readBody(nodeReq) : undefined;
+
+    // Cookie picker routes — no auth required (localhost-only)
+    if (url.pathname.startsWith('/cookie-picker')) {
+      const webReq = toWebRequest(nodeReq, url, body);
+      const response = await handleCookiePickerRoute(url, webReq, browserManager);
+      return sendResponse(nodeRes, response);
+    }
+
+    // Health check — no auth required (now async)
+    if (url.pathname === '/health') {
+      const healthy = await browserManager.isHealthy();
+      const response = new Response(JSON.stringify({
+        status: healthy ? 'healthy' : 'unhealthy',
+        uptime: Math.floor((Date.now() - startTime) / 1000),
+        tabs: browserManager.getTabCount(),
+        currentUrl: browserManager.getCurrentUrl(),
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      return sendResponse(nodeRes, response);
+    }
+
+    // All other endpoints require auth
+    const authHeader = nodeReq.headers['authorization'];
+    if (authHeader !== `Bearer ${AUTH_TOKEN}`) {
+      const response = new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      return sendResponse(nodeRes, response);
+    }
+
+    if (url.pathname === '/command' && nodeReq.method === 'POST') {
+      const parsed = JSON.parse(body || '{}');
+      const response = await handleCommand(parsed);
+      return sendResponse(nodeRes, response);
+    }
+
+    const response = new Response('Not found', { status: 404 });
+    return sendResponse(nodeRes, response);
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(port, '127.0.0.1', () => resolve());
   });
 
   // Write state file
@@ -307,7 +356,7 @@ async function start() {
     port,
     token: AUTH_TOKEN,
     startedAt: new Date().toISOString(),
-    serverPath: path.resolve(import.meta.dir, 'server.ts'),
+    serverPath: path.resolve(__dirname, 'server.ts'),
   };
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
 

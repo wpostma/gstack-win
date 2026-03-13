@@ -11,6 +11,12 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 const PORT_OFFSET = 45600;
 const BROWSE_PORT = process.env.CONDUCTOR_PORT
@@ -22,31 +28,33 @@ const MAX_START_WAIT = 8000; // 8 seconds to start
 
 export function resolveServerScript(
   env: Record<string, string | undefined> = process.env,
-  metaDir: string = import.meta.dir,
+  metaDir: string = __dirname,
   execPath: string = process.execPath
 ): string {
   if (env.BROWSE_SERVER_SCRIPT) {
     return env.BROWSE_SERVER_SCRIPT;
   }
 
-  // Dev mode: cli.ts runs directly from browse/src
-  if (metaDir.startsWith('/') && !metaDir.includes('$bunfs')) {
-    const direct = path.resolve(metaDir, 'server.ts');
-    if (fs.existsSync(direct)) {
-      return direct;
-    }
+  // Bundled mode: server.mjs in same directory as browse.mjs
+  const bundled = path.resolve(metaDir, 'server.mjs');
+  if (fs.existsSync(bundled)) {
+    return bundled;
   }
 
-  // Compiled binary: derive the source tree from browse/dist/browse
-  if (execPath) {
-    const adjacent = path.resolve(path.dirname(execPath), '..', 'src', 'server.ts');
-    if (fs.existsSync(adjacent)) {
-      return adjacent;
-    }
+  // Dev mode: running from browse/src
+  const direct = path.resolve(metaDir, 'server.ts');
+  if (fs.existsSync(direct)) {
+    return direct;
+  }
+
+  // Bundle mode: browse/dist/browse.mjs → browse/src/server.ts
+  const adjacent = path.resolve(metaDir, '..', 'src', 'server.ts');
+  if (fs.existsSync(adjacent)) {
+    return adjacent;
   }
 
   // Legacy fallback for user-level installs
-  return path.resolve(env.HOME || '/tmp', '.claude/skills/gstack/browse/src/server.ts');
+  return path.resolve(env.HOME || '/tmp', '.claude/skills/gstack/browse/dist/server.mjs');
 }
 
 const SERVER_SCRIPT = resolveServerScript();
@@ -83,11 +91,16 @@ async function startServer(): Promise<ServerState> {
   // Clean up stale state file
   try { fs.unlinkSync(STATE_FILE); } catch {}
 
-  // Start server as detached background process
-  const proc = Bun.spawn(['bun', 'run', SERVER_SCRIPT], {
+  // Start server as detached background process using Node (not bun)
+  const proc = spawn('node', [SERVER_SCRIPT], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env },
+    detached: false,
+    windowsHide: true,
   });
+
+  let stderrChunks: Buffer[] = [];
+  proc.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
 
   // Don't hold the CLI open
   proc.unref();
@@ -99,19 +112,13 @@ async function startServer(): Promise<ServerState> {
     if (state && isProcessAlive(state.pid)) {
       return state;
     }
-    await Bun.sleep(100);
+    await sleep(100);
   }
 
   // If we get here, server didn't start in time
-  // Try to read stderr for error message
-  const stderr = proc.stderr;
-  if (stderr) {
-    const reader = stderr.getReader();
-    const { value } = await reader.read();
-    if (value) {
-      const errText = new TextDecoder().decode(value);
-      throw new Error(`Server failed to start:\n${errText}`);
-    }
+  if (stderrChunks.length > 0) {
+    const errText = Buffer.concat(stderrChunks).toString();
+    throw new Error(`Server failed to start:\n${errText}`);
   }
   throw new Error(`Server failed to start within ${MAX_START_WAIT / 1000}s`);
 }
@@ -242,7 +249,9 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
 
   // Special case: chain reads from stdin
   if (command === 'chain' && commandArgs.length === 0) {
-    const stdin = await Bun.stdin.text();
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    const stdin = Buffer.concat(chunks).toString();
     commandArgs.push(stdin.trim());
   }
 
@@ -250,7 +259,10 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
   await sendCommand(state, command, commandArgs);
 }
 
-if (import.meta.main) {
+// Entry point check: run main if this is the directly-executed script
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === __filename
+  || process.argv[1]?.endsWith('browse.mjs');
+if (isMain) {
   main().catch((err) => {
     console.error(`[browse] ${err.message}`);
     process.exit(1);

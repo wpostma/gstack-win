@@ -5,28 +5,29 @@ set -e
 GSTACK_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILLS_DIR="$(dirname "$GSTACK_DIR")"
 BROWSE_BIN="$GSTACK_DIR/browse/dist/browse"
+BROWSE_MJS="$GSTACK_DIR/browse/dist/browse.mjs"
 
 ensure_playwright_browser() {
   (
     cd "$GSTACK_DIR"
-    bun --eval 'import { chromium } from "playwright"; const browser = await chromium.launch(); await browser.close();'
+    node -e "const { chromium } = require('./node_modules/playwright'); (async () => { const b = await chromium.launch({ headless: true }); await b.close(); })();"
   ) >/dev/null 2>&1
 }
 
-# 1. Build browse binary if needed (smart rebuild: stale sources, package.json, lock)
+# 1. Build browse bundles if needed (smart rebuild: stale sources, package.json, lock)
 NEEDS_BUILD=0
-if [ ! -x "$BROWSE_BIN" ]; then
+if [ ! -f "$BROWSE_MJS" ]; then
   NEEDS_BUILD=1
-elif [ -n "$(find "$GSTACK_DIR/browse/src" -type f -newer "$BROWSE_BIN" -print -quit 2>/dev/null)" ]; then
+elif [ -n "$(find "$GSTACK_DIR/browse/src" -type f -newer "$BROWSE_MJS" -print -quit 2>/dev/null)" ]; then
   NEEDS_BUILD=1
-elif [ "$GSTACK_DIR/package.json" -nt "$BROWSE_BIN" ]; then
+elif [ "$GSTACK_DIR/package.json" -nt "$BROWSE_MJS" ]; then
   NEEDS_BUILD=1
-elif [ -f "$GSTACK_DIR/bun.lock" ] && [ "$GSTACK_DIR/bun.lock" -nt "$BROWSE_BIN" ]; then
+elif [ -f "$GSTACK_DIR/bun.lock" ] && [ "$GSTACK_DIR/bun.lock" -nt "$BROWSE_MJS" ]; then
   NEEDS_BUILD=1
 fi
 
 if [ "$NEEDS_BUILD" -eq 1 ]; then
-  echo "Building browse binary..."
+  echo "Building browse bundles..."
   (
     cd "$GSTACK_DIR"
     bun install
@@ -34,9 +35,15 @@ if [ "$NEEDS_BUILD" -eq 1 ]; then
   )
 fi
 
-if [ ! -x "$BROWSE_BIN" ]; then
-  echo "gstack setup failed: browse binary missing at $BROWSE_BIN" >&2
+if [ ! -f "$BROWSE_MJS" ]; then
+  echo "gstack setup failed: browse bundle missing at $BROWSE_MJS" >&2
   exit 1
+fi
+
+# Ensure wrapper script exists
+if [ ! -x "$BROWSE_BIN" ]; then
+  printf '#!/usr/bin/env bash\nSCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\nexec node "$SCRIPT_DIR/browse.mjs" "$@"\n' > "$BROWSE_BIN"
+  chmod +x "$BROWSE_BIN"
 fi
 
 # 2. Ensure Playwright's Chromium is available

@@ -32,7 +32,7 @@
  *   └──────────────────────────────────────────────────────────────────┘
  */
 
-import { Database } from 'bun:sqlite';
+import Database from 'better-sqlite3';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -120,7 +120,7 @@ export function listDomains(browserName: string, profile = 'Default'): { domains
   const db = openDb(dbPath, browser.name);
   try {
     const now = chromiumNow();
-    const rows = db.query(
+    const rows = db.prepare(
       `SELECT host_key AS domain, COUNT(*) AS count
        FROM cookies
        WHERE has_expires = 0 OR expires_utc > ?
@@ -152,7 +152,7 @@ export async function importCookies(
     const now = chromiumNow();
     // Parameterized query — no SQL injection
     const placeholders = domains.map(() => '?').join(',');
-    const rows = db.query(
+    const rows = db.prepare(
       `SELECT host_key, name, value, encrypted_value, path, expires_utc,
               is_secure, is_httponly, has_expires, samesite
        FROM cookies
@@ -284,12 +284,21 @@ async function getDerivedKey(browser: BrowserInfo): Promise<Buffer> {
 }
 
 async function getKeychainPassword(service: string): Promise<string> {
-  // Use async Bun.spawn with timeout to avoid blocking the event loop.
+  // Use async spawn with timeout to avoid blocking the event loop.
   // macOS may show an Allow/Deny dialog that blocks until the user responds.
-  const proc = Bun.spawn(
-    ['security', 'find-generic-password', '-s', service, '-w'],
-    { stdout: 'pipe', stderr: 'pipe' },
-  );
+  const { spawn: spawnProc } = await import('child_process');
+  const proc = spawnProc('security', ['find-generic-password', '-s', service, '-w'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stdoutData = '';
+  let stderrData = '';
+  proc.stdout?.on('data', (chunk: Buffer) => { stdoutData += chunk.toString(); });
+  proc.stderr?.on('data', (chunk: Buffer) => { stderrData += chunk.toString(); });
+
+  const exitPromise = new Promise<number | null>((resolve) => {
+    proc.on('close', (code) => resolve(code));
+  });
 
   const timeout = new Promise<never>((_, reject) =>
     setTimeout(() => {
@@ -303,9 +312,9 @@ async function getKeychainPassword(service: string): Promise<string> {
   );
 
   try {
-    const exitCode = await Promise.race([proc.exited, timeout]);
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await Promise.race([exitPromise, timeout]);
+    const stdout = stdoutData;
+    const stderr = stderrData;
 
     if (exitCode !== 0) {
       // Distinguish denied vs not found vs other
